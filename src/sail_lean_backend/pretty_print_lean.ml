@@ -1221,9 +1221,26 @@ let doc_funcl_body fixup_binders ctx (FCL_aux (FCL_funcl (id, pexp), annot)) =
   let is_monadic = has_effect exp || not (Effects.function_is_pure id ctx.global.effect_info) in
   if untranslatable_mapping id exp then string "throw Error.Exit" else doc_exp is_monadic (context_with_env ctx env) exp
 
-let doc_termination fixup_binders ctx fnpat (Rec_aux (meas, _)) =
+(* The functions an expression calls. *)
+let calls_of_exp exp =
+  fold_exp
+    {
+      (pure_exp_alg IdSet.empty IdSet.union) with
+      e_app = (fun (id, es) -> List.fold_left IdSet.union (IdSet.singleton id) es);
+    }
+    exp
+
+(* Lean warns about a `termination_by` on a definition that is not recursive ("unused
+   `termination_by`, function is not recursive").  Outside a `mutual` block a definition is
+   recursive iff its body calls itself; the copies Sail makes when it specialises a mutually
+   recursive group (the `_mutrec_` functions) keep the group's termination measure although some
+   of them no longer call themselves.  Inside a `mutual` block a function can recur through a
+   sibling, so the measure is always kept there. *)
+let doc_termination ~standalone fixup_binders ctx fnpat (FCL_aux (FCL_funcl (id, pexp), _)) (Rec_aux (meas, _)) =
+  let _, _, body, _ = destruct_pexp pexp in
   match meas with
   | Rec_nonrec | Rec_rec -> empty
+  | Rec_measure _ when standalone && not (IdSet.mem id (calls_of_exp body)) -> empty
   | Rec_measure (pat, exp) ->
       (* TODO: actually use the pattern *)
       let term =
@@ -1242,10 +1259,10 @@ let doc_termination fixup_binders ctx fnpat (Rec_aux (meas, _)) =
 let pat_of_funcl (FCL_aux (FCL_funcl (_, funcl), _)) =
   match funcl with Pat_aux (Pat_exp (pat, _), _) -> pat | Pat_aux (Pat_when (pat, _, _), _) -> pat
 
-let doc_funcl ctx meas funcl =
+let doc_funcl ~standalone ctx meas funcl =
   let comment, signature, ctx, fixup_binders = doc_funcl_init ctx.global funcl in
   let fnpat = pat_of_funcl funcl in
-  let termination = doc_termination fixup_binders ctx fnpat meas in
+  let termination = doc_termination ~standalone fixup_binders ctx fnpat funcl meas in
   comment ^^ nest 2 (signature ^^ hardline ^^ doc_funcl_body fixup_binders ctx funcl) ^^ termination
 
 let string_of_pexp p =
@@ -1253,10 +1270,10 @@ let string_of_pexp p =
   let guard_str = match guard with None -> "" | Some guard -> " if " ^ string_of_exp guard in
   "| " ^ string_of_pat pat ^ guard_str ^ " -> " ^ string_of_exp exp ^ "\n"
 
-let doc_fundef ctx (FD_aux (FD_function (meas, typa, fcls), fannot) as full_fundef) =
+let doc_fundef ?(standalone = false) ctx (FD_aux (FD_function (meas, typa, fcls), fannot) as full_fundef) =
   match fcls with
   | [] -> failwith "FD_function with empty function list"
-  | [funcl] -> doc_funcl ctx meas funcl
+  | [funcl] -> doc_funcl ~standalone ctx meas funcl
   | funcls ->
       failwith
         (List.fold_left
@@ -1393,7 +1410,7 @@ let rec doc_defs_rec ctx defs types (former_funcs : document list) (docdefs : do
       let env = dannot.env in
       let pp_f =
         if Env.is_extern (id_of_fundef fdef) env "lean" then docdefs
-        else docdefs ^^ group (doc_fundef ctx fdef) ^/^ hardline
+        else docdefs ^^ group (doc_fundef ~standalone:true ctx fdef) ^/^ hardline
       in
       doc_defs_rec ctx defs' types former_funcs pp_f
   | DEF_aux (DEF_internal_mutrec fdefs, dannot) :: defs' ->
